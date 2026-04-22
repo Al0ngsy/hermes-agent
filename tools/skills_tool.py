@@ -80,6 +80,37 @@ from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Optional storage backend — set via init_storage() at startup.
+# When configured, hub-installed and user-created skill metadata is mirrored
+# in the structured state backend via SkillRegistry.  Bundled skills (those
+# in the repo's skills/ directory) are never written to the backend.
+# ---------------------------------------------------------------------------
+_skills_backend = None  # type: Optional[Any]  # StructuredStateBackend
+
+
+def init_storage(backend) -> None:
+    """Opt-in to backend-backed skill metadata storage.
+
+    Call this once at startup (after create_storage_backends()) to enable
+    the SkillRegistry for hub-installed and user-created skills.  When not
+    called, all existing file-based logic continues to work unchanged.
+
+    Args:
+        backend: A ``StructuredStateBackend`` instance.
+    """
+    global _skills_backend
+    _skills_backend = backend
+    logger.debug("skills_tool: storage backend configured (%s)", type(backend).__name__)
+
+
+def get_skill_registry():
+    """Return a SkillRegistry bound to the configured backend, or None."""
+    if _skills_backend is None:
+        return None
+    from storage.skill_registry import SkillRegistry
+    return SkillRegistry(_skills_backend)
+
 
 # All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
 # This is the single source of truth -- agent edits, hub installs, and bundled

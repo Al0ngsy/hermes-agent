@@ -369,19 +369,24 @@ class LocalDistributedLockBackend(DistributedLockBackend):
         deadline = time.time() + wait_seconds if wait_seconds > 0 else time.time()
 
         while time.time() <= deadline:
-            try:
-                with self._lock:
+            with self._lock:
+                # Evict any expired row first so it doesn't block us.
+                self._conn.execute(
+                    "DELETE FROM locks WHERE lock_id = ? AND expires_at <= ?",
+                    (lock_id, time.time()),
+                )
+                try:
                     self._conn.execute(
                         "INSERT INTO locks (lock_id, expires_at) VALUES (?, ?)",
                         (lock_id, expires_at),
                     )
                     self._conn.commit()
-                return LockHandle(lock_id, expires_at, self)
-            except sqlite3.IntegrityError:
-                # Lock already held
-                if wait_seconds <= 0:
-                    return None
-                time.sleep(0.05)
+                    return LockHandle(lock_id, expires_at, self)
+                except sqlite3.IntegrityError:
+                    # A live (non-expired) lock is already held.
+                    if wait_seconds <= 0:
+                        return None
+            time.sleep(0.05)
 
         return None
 

@@ -44,6 +44,35 @@ from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Optional storage backend — set via init_storage() at startup.
+# When configured, agent-created skills are registered in the structured state
+# backend via SkillRegistry.  File-based logic continues to work when not set.
+# ---------------------------------------------------------------------------
+_skills_backend = None  # type: Optional[Any]  # StructuredStateBackend
+
+
+def init_storage(backend) -> None:
+    """Opt-in to backend-backed skill metadata storage.
+
+    Args:
+        backend: A ``StructuredStateBackend`` instance.
+    """
+    global _skills_backend
+    _skills_backend = backend
+    logger.debug(
+        "skill_manager_tool: storage backend configured (%s)", type(backend).__name__
+    )
+
+
+def get_skill_registry():
+    """Return a SkillRegistry bound to the configured backend, or None."""
+    if _skills_backend is None:
+        return None
+    from storage.skill_registry import SkillRegistry
+    return SkillRegistry(_skills_backend)
+
+
 # Import security scanner — agent-created skills get the same scrutiny as
 # community hub installs.
 try:

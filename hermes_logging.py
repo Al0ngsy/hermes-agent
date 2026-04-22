@@ -25,7 +25,9 @@ Session context:
 
 import logging
 import os
+import sys
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional, Sequence
@@ -150,6 +152,15 @@ COMPONENT_PREFIXES = {
 
 
 # ---------------------------------------------------------------------------
+# Stateless mode helpers
+# ---------------------------------------------------------------------------
+
+def is_stateless_mode() -> bool:
+    """Return True if Hermes is running in stateless mode (no persistent disk writes)."""
+    return os.environ.get("HERMES_STATELESS", "").lower() in ("1", "true", "yes")
+
+
+# ---------------------------------------------------------------------------
 # Main setup
 # ---------------------------------------------------------------------------
 
@@ -196,6 +207,13 @@ def setup_logging(
     """
     global _logging_initialized
     if _logging_initialized and not force:
+        home = hermes_home or get_hermes_home()
+        return home / "logs"
+
+    # In stateless mode refuse all file I/O and fall back to stderr-only logging.
+    if is_stateless_mode():
+        configure_stateless_logging(level=getattr(logging, (log_level or "INFO").upper(), logging.INFO))
+        _logging_initialized = True
         home = hermes_home or get_hermes_home()
         return home / "logs"
 
@@ -258,6 +276,52 @@ def setup_logging(
 
     _logging_initialized = True
     return log_dir
+
+
+def configure_stateless_logging(level: int = logging.INFO) -> None:
+    """Configure logging for stateless mode: stderr only, no file writes.
+
+    Removes any existing FileHandlers and ensures a single StreamHandler on
+    stderr is attached to the root logger.  Safe to call multiple times.
+
+    To activate automatically, set the ``HERMES_STATELESS=1`` environment
+    variable before startup.  ``setup_logging()`` will detect this and delegate
+    here instead of creating rotating file handlers.
+
+    Integration note for run_agent.py (or any entry point that calls
+    ``setup_logging()``): simply set ``HERMES_STATELESS=1`` in the environment
+    before calling ``setup_logging()`` and this function will be invoked
+    automatically.  Alternatively, call ``configure_stateless_logging()``
+    directly before any other logging setup::
+
+        # At the top of your entry-point, before setup_logging():
+        import os
+        if os.environ.get("HERMES_STATELESS", "").lower() in ("1", "true", "yes"):
+            from hermes_logging import configure_stateless_logging
+            configure_stateless_logging()
+    """
+    root = logging.getLogger()
+    # Remove any existing file handlers.
+    for handler in root.handlers[:]:
+        if isinstance(handler, logging.FileHandler):
+            root.removeHandler(handler)
+    # Ensure a stderr stream handler exists.
+    if not any(
+        isinstance(h, logging.StreamHandler)
+        and not isinstance(h, logging.FileHandler)
+        and getattr(h, "stream", None) is sys.stderr
+        for h in root.handlers
+    ):
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setLevel(level)
+        formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        handler.setFormatter(formatter)
+        root.addHandler(handler)
+    if root.level == logging.NOTSET or root.level > level:
+        root.setLevel(level)
+    # Suppress noisy third-party loggers.
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def setup_verbose_logging() -> None:
@@ -388,3 +452,42 @@ def _read_logging_config():
     except Exception:
         pass
     return (None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Artifact logging
+# ---------------------------------------------------------------------------
+
+class ArtifactLogger:
+    """Stores user-visible artifacts (transcripts, exports) via the artifact backend.
+
+    This is the only logging-adjacent component that persists data to disk (or
+    object storage).  In stateless mode this is the *only* persistence path —
+    all operational logs go to stderr, but user-facing exports/recordings are
+    routed here so callers can retrieve them later via the storage URI.
+
+    Usage::
+
+        from hermes_logging import ArtifactLogger
+        artifact_logger = ArtifactLogger(storage_backends.artifacts)
+        uri = artifact_logger.write_session_transcript(session_id, transcript_text)
+    """
+
+    def __init__(self, artifact_backend=None):
+        self._backend = artifact_backend
+
+    def init_backend(self, artifact_backend) -> None:
+        """Set the artifact backend (called at startup when the backend is ready)."""
+        self._backend = artifact_backend
+
+    def write_export(self, name: str, content: bytes, export_type: str = "text") -> Optional[str]:
+        """Write a user-visible export. Returns the storage URI or None if no backend configured."""
+        if self._backend is None:
+            return None
+        artifact_id = f"export:{export_type}:{name}:{int(time.time())}"
+        uri = self._backend.write_artifact(artifact_id, content)
+        return uri
+
+    def write_session_transcript(self, session_id: str, transcript: str) -> Optional[str]:
+        """Write a session transcript as an artifact. Returns the storage URI or None."""
+        return self.write_export(session_id, transcript.encode("utf-8"), "transcript")

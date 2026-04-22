@@ -25,6 +25,11 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
+try:
+    from storage.backends import StructuredStateBackend as _StructuredStateBackend
+except ImportError:
+    _StructuredStateBackend = None
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -135,29 +140,40 @@ class SessionDB:
     # Attempt a PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 50
 
-    def __init__(self, db_path: Path = None):
-        self.db_path = db_path or DEFAULT_DB_PATH
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    # ── Backend storage key helpers ──
 
+    def _meta_key(self, session_id: str) -> str:
+        return f"sessions:meta:{session_id}"
+
+    def _index_key(self, session_id: str) -> str:
+        return f"sessions:index:{session_id}"
+
+    def _msg_key(self, session_id: str, seq: int) -> str:
+        return f"sessions:msgs:{session_id}:{seq:010d}"
+
+    def __init__(self, db_path: Path = None, backend=None):
+        self._backend = backend
         self._lock = threading.Lock()
         self._write_count = 0
-        self._conn = sqlite3.connect(
-            str(self.db_path),
-            check_same_thread=False,
-            # Short timeout — application-level retry with random jitter
-            # handles contention instead of sitting in SQLite's internal
-            # busy handler for up to 30s.
-            timeout=1.0,
-            # Autocommit mode: Python's default isolation_level="" auto-starts
-            # transactions on DML, which conflicts with our explicit
-            # BEGIN IMMEDIATE.  None = we manage transactions ourselves.
-            isolation_level=None,
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
 
-        self._init_schema()
+        if backend is None:
+            # Original SQLite path — unchanged behavior
+            self.db_path = db_path or DEFAULT_DB_PATH
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False,
+                timeout=1.0,
+                isolation_level=None,
+            )
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._init_schema()
+        else:
+            # Backend abstraction path — no direct SQLite connection
+            self.db_path = db_path
+            self._conn = None
 
     # ── Core write helper ──
 
@@ -240,6 +256,8 @@ class SessionDB:
         Attempts a PASSIVE WAL checkpoint first so that exiting processes
         help keep the WAL file from growing unbounded.
         """
+        if self._backend is not None:
+            return  # Backend manages its own lifecycle
         with self._lock:
             if self._conn:
                 try:
@@ -363,6 +381,30 @@ class SessionDB:
         parent_session_id: str = None,
     ) -> str:
         """Create a new session record. Returns the session_id."""
+        if self._backend is not None:
+            now = time.time()
+            meta = {
+                "id": session_id, "source": source, "user_id": user_id,
+                "model": model, "model_config": model_config,
+                "system_prompt": system_prompt, "parent_session_id": parent_session_id,
+                "started_at": now, "ended_at": None, "end_reason": None,
+                "message_count": 0, "tool_call_count": 0,
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0,
+                "billing_provider": None, "billing_base_url": None, "billing_mode": None,
+                "estimated_cost_usd": None, "actual_cost_usd": None,
+                "cost_status": None, "cost_source": None, "pricing_version": None,
+                "title": None,
+            }
+            meta_key = self._meta_key(session_id)
+            if self._backend.get_json(meta_key) is None:
+                self._backend.set_json(meta_key, meta)
+                self._backend.set_json(self._index_key(session_id), {
+                    "id": session_id, "source": source,
+                    "started_at": now, "title": None,
+                    "parent_session_id": parent_session_id,
+                })
+            return session_id
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
@@ -392,6 +434,15 @@ class SessionDB:
         with a different reason. Use ``reopen_session()`` first if you
         intentionally need to re-end a closed session with a new reason.
         """
+        if self._backend is not None:
+            meta_key = self._meta_key(session_id)
+            with self._lock:
+                meta = self._backend.get_json(meta_key)
+                if meta and meta.get("ended_at") is None:
+                    meta["ended_at"] = time.time()
+                    meta["end_reason"] = end_reason
+                    self._backend.set_json(meta_key, meta)
+            return
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
@@ -402,6 +453,15 @@ class SessionDB:
 
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
+        if self._backend is not None:
+            meta_key = self._meta_key(session_id)
+            with self._lock:
+                meta = self._backend.get_json(meta_key)
+                if meta:
+                    meta["ended_at"] = None
+                    meta["end_reason"] = None
+                    self._backend.set_json(meta_key, meta)
+            return
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
@@ -411,6 +471,13 @@ class SessionDB:
 
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
+        if self._backend is not None:
+            meta_key = self._meta_key(session_id)
+            with self._lock:
+                meta = self._backend.get_json(meta_key) or {}
+                meta["system_prompt"] = system_prompt
+                self._backend.set_json(meta_key, meta)
+            return
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET system_prompt = ? WHERE id = ?",
@@ -446,6 +513,44 @@ class SessionDB:
         the caller already holds cumulative totals (gateway path, where the
         cached agent accumulates across messages).
         """
+        if self._backend is not None:
+            meta_key = self._meta_key(session_id)
+            with self._lock:
+                meta = self._backend.get_json(meta_key) or {}
+                if absolute:
+                    meta["input_tokens"] = input_tokens
+                    meta["output_tokens"] = output_tokens
+                    meta["cache_read_tokens"] = cache_read_tokens
+                    meta["cache_write_tokens"] = cache_write_tokens
+                    meta["reasoning_tokens"] = reasoning_tokens
+                    meta["estimated_cost_usd"] = estimated_cost_usd or 0
+                    if actual_cost_usd is not None:
+                        meta["actual_cost_usd"] = actual_cost_usd
+                else:
+                    meta["input_tokens"] = meta.get("input_tokens", 0) + input_tokens
+                    meta["output_tokens"] = meta.get("output_tokens", 0) + output_tokens
+                    meta["cache_read_tokens"] = meta.get("cache_read_tokens", 0) + cache_read_tokens
+                    meta["cache_write_tokens"] = meta.get("cache_write_tokens", 0) + cache_write_tokens
+                    meta["reasoning_tokens"] = meta.get("reasoning_tokens", 0) + reasoning_tokens
+                    meta["estimated_cost_usd"] = (meta.get("estimated_cost_usd") or 0) + (estimated_cost_usd or 0)
+                    if actual_cost_usd is not None:
+                        meta["actual_cost_usd"] = (meta.get("actual_cost_usd") or 0) + actual_cost_usd
+                if cost_status:
+                    meta["cost_status"] = cost_status
+                if cost_source:
+                    meta["cost_source"] = cost_source
+                if pricing_version:
+                    meta["pricing_version"] = pricing_version
+                if billing_provider and not meta.get("billing_provider"):
+                    meta["billing_provider"] = billing_provider
+                if billing_base_url and not meta.get("billing_base_url"):
+                    meta["billing_base_url"] = billing_base_url
+                if billing_mode and not meta.get("billing_mode"):
+                    meta["billing_mode"] = billing_mode
+                if model and not meta.get("model"):
+                    meta["model"] = model
+                self._backend.set_json(meta_key, meta)
+            return
         if absolute:
             sql = """UPDATE sessions SET
                    input_tokens = ?,
@@ -520,6 +625,29 @@ class SessionDB:
         create_session() call (e.g. transient SQLite lock at agent startup).
         INSERT OR IGNORE is safe to call even when the row already exists.
         """
+        if self._backend is not None:
+            meta_key = self._meta_key(session_id)
+            if self._backend.get_json(meta_key) is None:
+                now = time.time()
+                meta = {
+                    "id": session_id, "source": source, "model": model,
+                    "user_id": None, "model_config": None, "system_prompt": None,
+                    "parent_session_id": None, "started_at": now,
+                    "ended_at": None, "end_reason": None,
+                    "message_count": 0, "tool_call_count": 0,
+                    "input_tokens": 0, "output_tokens": 0,
+                    "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0,
+                    "billing_provider": None, "billing_base_url": None, "billing_mode": None,
+                    "estimated_cost_usd": None, "actual_cost_usd": None,
+                    "cost_status": None, "cost_source": None, "pricing_version": None,
+                    "title": None,
+                }
+                self._backend.set_json(meta_key, meta)
+                self._backend.set_json(self._index_key(session_id), {
+                    "id": session_id, "source": source,
+                    "started_at": now, "title": None, "parent_session_id": None,
+                })
+            return
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions
@@ -531,6 +659,8 @@ class SessionDB:
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
+        if self._backend is not None:
+            return self._backend.get_json(self._meta_key(session_id))
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT * FROM sessions WHERE id = ?", (session_id,)
@@ -548,6 +678,17 @@ class SessionDB:
         exact = self.get_session(session_id_or_prefix)
         if exact:
             return exact["id"]
+
+        if self._backend is not None:
+            prefix_str = "sessions:index:"
+            all_keys = self._backend.list_keys(prefix_str)
+            matches = [
+                k[len(prefix_str):] for k in all_keys
+                if k[len(prefix_str):].startswith(session_id_or_prefix)
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            return None
 
         escaped = (
             session_id_or_prefix
@@ -621,6 +762,22 @@ class SessionDB:
         Empty/whitespace-only strings are normalized to None (clearing the title).
         """
         title = self.sanitize_title(title)
+        if self._backend is not None:
+            with self._lock:
+                if title:
+                    for k in self._backend.list_keys("sessions:meta:"):
+                        other = self._backend.get_json(k)
+                        if other and other.get("title") == title and other.get("id") != session_id:
+                            raise ValueError(f"Title '{title}' is already in use by session {other['id']}")
+                meta = self._backend.get_json(self._meta_key(session_id))
+                if not meta:
+                    return False
+                meta["title"] = title
+                self._backend.set_json(self._meta_key(session_id), meta)
+                idx = self._backend.get_json(self._index_key(session_id)) or {}
+                idx["title"] = title
+                self._backend.set_json(self._index_key(session_id), idx)
+            return True
         def _do(conn):
             if title:
                 # Check uniqueness (allow the same session to keep its own title)
@@ -643,6 +800,9 @@ class SessionDB:
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
+        if self._backend is not None:
+            meta = self._backend.get_json(self._meta_key(session_id))
+            return meta.get("title") if meta else None
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT title FROM sessions WHERE id = ?", (session_id,)
@@ -652,6 +812,12 @@ class SessionDB:
 
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
+        if self._backend is not None:
+            for k in self._backend.list_keys("sessions:meta:"):
+                meta = self._backend.get_json(k)
+                if meta and meta.get("title") == title:
+                    return meta
+            return None
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT * FROM sessions WHERE title = ?", (title,)
@@ -669,6 +835,17 @@ class SessionDB:
         """
         # First try exact match
         exact = self.get_session_by_title(title)
+
+        if self._backend is not None:
+            numbered = []
+            for k in self._backend.list_keys("sessions:meta:"):
+                meta = self._backend.get_json(k)
+                if meta and meta.get("title", "").startswith(title + " #"):
+                    numbered.append(meta)
+            if numbered:
+                numbered.sort(key=lambda m: m.get("started_at", 0), reverse=True)
+                return numbered[0]["id"]
+            return exact["id"] if exact else None
 
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
@@ -700,6 +877,22 @@ class SessionDB:
             base = match.group(1)
         else:
             base = base_title
+
+        if self._backend is not None:
+            existing = []
+            for k in self._backend.list_keys("sessions:meta:"):
+                meta = self._backend.get_json(k)
+                t = meta.get("title") if meta else None
+                if t and (t == base or t.startswith(base + " #")):
+                    existing.append(t)
+            if not existing:
+                return base
+            max_num = 1
+            for t in existing:
+                m = re.match(r'^.* #(\d+)$', t)
+                if m:
+                    max_num = max(max_num, int(m.group(1)))
+            return f"{base} #{max_num + 1}"
 
         # Find all existing numbered variants
         # Escape SQL LIKE wildcards (%, _) in the base to prevent false matches
@@ -742,6 +935,26 @@ class SessionDB:
         # Bound the walk defensively — compression chains this deep are
         # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
+            if self._backend is not None:
+                current_meta = self._backend.get_json(self._meta_key(current))
+                if not current_meta or current_meta.get("end_reason") != "compression":
+                    return current
+                ended_at = current_meta.get("ended_at")
+                if ended_at is None:
+                    return current
+                best_child = None
+                best_started = None
+                for k in self._backend.list_keys("sessions:meta:"):
+                    meta = self._backend.get_json(k)
+                    if (meta and meta.get("parent_session_id") == current
+                            and meta.get("started_at", 0) >= ended_at):
+                        if best_started is None or meta["started_at"] > best_started:
+                            best_child = meta["id"]
+                            best_started = meta["started_at"]
+                if best_child is None:
+                    return current
+                current = best_child
+                continue
             with self._lock:
                 cursor = self._conn.execute(
                     "SELECT id FROM sessions "
@@ -787,6 +1000,62 @@ class SessionDB:
         delegate subagents and branches hidden. Pass ``False`` to return the
         raw root rows (useful for admin/debug UIs).
         """
+        if self._backend is not None:
+            all_keys = self._backend.list_keys("sessions:meta:")
+            all_metas = list(self._backend.batch_get(all_keys).values())
+            all_metas.sort(key=lambda m: m.get("started_at", 0), reverse=True)
+            filtered = []
+            for meta in all_metas:
+                if not include_children and meta.get("parent_session_id") is not None:
+                    continue
+                if source and meta.get("source") != source:
+                    continue
+                if exclude_sources and meta.get("source") in exclude_sources:
+                    continue
+                filtered.append(meta)
+            paginated = filtered[offset:offset + limit]
+            sessions = []
+            for meta in paginated:
+                s = dict(meta)
+                msg_keys = sorted(self._backend.list_keys(f"sessions:msgs:{meta['id']}:"))
+                s["preview"] = ""
+                s["last_active"] = meta.get("started_at", 0)
+                for mk in msg_keys:
+                    msg = self._backend.get_json(mk)
+                    if msg and msg.get("role") == "user" and msg.get("content"):
+                        raw = (msg["content"] or "").replace("\n", " ").replace("\r", " ")[:63].strip()
+                        s["preview"] = raw[:60] + ("..." if len(raw) > 60 else "")
+                        break
+                if msg_keys:
+                    last_msg = self._backend.get_json(msg_keys[-1])
+                    if last_msg:
+                        s["last_active"] = last_msg.get("timestamp", meta.get("started_at", 0))
+                sessions.append(s)
+            if project_compression_tips and not include_children:
+                projected = []
+                for s in sessions:
+                    if s.get("end_reason") != "compression":
+                        projected.append(s)
+                        continue
+                    tip_id = self.get_compression_tip(s["id"])
+                    if tip_id == s["id"]:
+                        projected.append(s)
+                        continue
+                    tip_row = self._get_session_rich_row(tip_id)
+                    if not tip_row:
+                        projected.append(s)
+                        continue
+                    merged = dict(s)
+                    for key in ("id", "ended_at", "end_reason", "message_count",
+                                "tool_call_count", "title", "last_active", "preview",
+                                "model", "system_prompt"):
+                        if key in tip_row:
+                            merged[key] = tip_row[key]
+                    merged["_lineage_root_id"] = s["id"]
+                    projected.append(merged)
+                sessions = projected
+            return sessions
+
         where_clauses = []
         params = []
 
@@ -877,6 +1146,25 @@ class SessionDB:
         ``list_sessions_rich`` (preview + last_active). Returns None if the
         session doesn't exist.
         """
+        if self._backend is not None:
+            meta = self._backend.get_json(self._meta_key(session_id))
+            if not meta:
+                return None
+            s = dict(meta)
+            msg_keys = sorted(self._backend.list_keys(f"sessions:msgs:{session_id}:"))
+            s["preview"] = ""
+            s["last_active"] = meta.get("started_at", 0)
+            for mk in msg_keys:
+                msg = self._backend.get_json(mk)
+                if msg and msg.get("role") == "user" and msg.get("content"):
+                    raw = (msg["content"] or "").replace("\n", " ").replace("\r", " ")[:63].strip()
+                    s["preview"] = raw[:60] + ("..." if len(raw) > 60 else "")
+                    break
+            if msg_keys:
+                last_msg = self._backend.get_json(msg_keys[-1])
+                if last_msg:
+                    s["last_active"] = last_msg.get("timestamp", meta.get("started_at", 0))
+            return s
         query = """
             SELECT s.*,
                 COALESCE(
@@ -931,6 +1219,37 @@ class SessionDB:
         Also increments the session's message_count (and tool_call_count
         if role is 'tool' or tool_calls is present).
         """
+        num_tool_calls = 0
+        if tool_calls is not None:
+            num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
+
+        if self._backend is not None:
+            meta_key = self._meta_key(session_id)
+            with self._lock:
+                meta = self._backend.get_json(meta_key) or {}
+                seq = meta.get("message_count", 0)
+                msg_dict = {
+                    "id": seq,
+                    "session_id": session_id,
+                    "role": role,
+                    "content": content,
+                    "tool_call_id": tool_call_id,
+                    "tool_calls": tool_calls,
+                    "tool_name": tool_name,
+                    "timestamp": time.time(),
+                    "token_count": token_count,
+                    "finish_reason": finish_reason,
+                    "reasoning": reasoning,
+                    "reasoning_details": reasoning_details,
+                    "codex_reasoning_items": codex_reasoning_items,
+                }
+                self._backend.set_json(self._msg_key(session_id, seq), msg_dict)
+                meta["message_count"] = seq + 1
+                if num_tool_calls > 0:
+                    meta["tool_call_count"] = meta.get("tool_call_count", 0) + num_tool_calls
+                self._backend.set_json(meta_key, meta)
+            return seq
+
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
             json.dumps(reasoning_details)
@@ -941,11 +1260,6 @@ class SessionDB:
             if codex_reasoning_items else None
         )
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
-
-        # Pre-compute tool call count
-        num_tool_calls = 0
-        if tool_calls is not None:
-            num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
         def _do(conn):
             cursor = conn.execute(
@@ -988,6 +1302,13 @@ class SessionDB:
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by timestamp."""
+        if self._backend is not None:
+            prefix = f"sessions:msgs:{session_id}:"
+            msg_keys = sorted(self._backend.list_keys(prefix))
+            if not msg_keys:
+                return []
+            msgs_map = self._backend.batch_get(msg_keys)
+            return [dict(msgs_map[k]) for k in msg_keys if k in msgs_map]
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
@@ -1011,6 +1332,26 @@ class SessionDB:
         Load messages in the OpenAI conversation format (role + content dicts).
         Used by the gateway to restore conversation history.
         """
+        if self._backend is not None:
+            raw_messages = self.get_messages(session_id)
+            messages = []
+            for row in raw_messages:
+                msg = {"role": row["role"], "content": row.get("content")}
+                if row.get("tool_call_id"):
+                    msg["tool_call_id"] = row["tool_call_id"]
+                if row.get("tool_name"):
+                    msg["tool_name"] = row["tool_name"]
+                if row.get("tool_calls") is not None:
+                    msg["tool_calls"] = row["tool_calls"]
+                if row.get("role") == "assistant":
+                    if row.get("reasoning"):
+                        msg["reasoning"] = row["reasoning"]
+                    if row.get("reasoning_details") is not None:
+                        msg["reasoning_details"] = row["reasoning_details"]
+                    if row.get("codex_reasoning_items") is not None:
+                        msg["codex_reasoning_items"] = row["codex_reasoning_items"]
+                messages.append(msg)
+            return messages
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, "
@@ -1149,6 +1490,41 @@ class SessionDB:
         """
         if not query or not query.strip():
             return []
+
+        if self._backend is not None:
+            try:
+                results = self._backend.search(query, prefix="sessions:msgs:", limit=limit + offset)
+            except Exception:
+                results = []
+            matches = []
+            for key, msg in results:
+                parts = key.split(":")
+                session_id_from_key = parts[2] if len(parts) >= 3 else None
+                if not session_id_from_key:
+                    continue
+                session_meta = self._backend.get_json(self._meta_key(session_id_from_key))
+                if not session_meta:
+                    continue
+                if source_filter is not None and session_meta.get("source") not in source_filter:
+                    continue
+                if exclude_sources is not None and session_meta.get("source") in exclude_sources:
+                    continue
+                if role_filter and msg.get("role") not in role_filter:
+                    continue
+                content = msg.get("content") or ""
+                matches.append({
+                    "id": msg.get("id", 0),
+                    "session_id": session_id_from_key,
+                    "role": msg.get("role"),
+                    "snippet": content[:200],
+                    "timestamp": msg.get("timestamp"),
+                    "tool_name": msg.get("tool_name"),
+                    "source": session_meta.get("source"),
+                    "model": session_meta.get("model"),
+                    "session_started": session_meta.get("started_at"),
+                    "context": [],
+                })
+            return matches[offset:offset + limit]
 
         query = self._sanitize_fts5_query(query)
         if not query:
@@ -1302,6 +1678,13 @@ class SessionDB:
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """List sessions, optionally filtered by source."""
+        if self._backend is not None:
+            all_keys = self._backend.list_keys("sessions:meta:")
+            metas = list(self._backend.batch_get(all_keys).values())
+            metas.sort(key=lambda m: m.get("started_at", 0), reverse=True)
+            if source:
+                metas = [m for m in metas if m.get("source") == source]
+            return metas[offset:offset + limit]
         with self._lock:
             if source:
                 cursor = self._conn.execute(
@@ -1321,6 +1704,16 @@ class SessionDB:
 
     def session_count(self, source: str = None) -> int:
         """Count sessions, optionally filtered by source."""
+        if self._backend is not None:
+            all_keys = self._backend.list_keys("sessions:meta:")
+            if not source:
+                return len(all_keys)
+            count = 0
+            for k in all_keys:
+                meta = self._backend.get_json(k)
+                if meta and meta.get("source") == source:
+                    count += 1
+            return count
         with self._lock:
             if source:
                 cursor = self._conn.execute(
@@ -1332,6 +1725,16 @@ class SessionDB:
 
     def message_count(self, session_id: str = None) -> int:
         """Count messages, optionally for a specific session."""
+        if self._backend is not None:
+            if session_id:
+                meta = self._backend.get_json(self._meta_key(session_id))
+                return meta.get("message_count", 0) if meta else 0
+            total = 0
+            for k in self._backend.list_keys("sessions:meta:"):
+                meta = self._backend.get_json(k)
+                if meta:
+                    total += meta.get("message_count", 0)
+            return total
         with self._lock:
             if session_id:
                 cursor = self._conn.execute(
@@ -1367,6 +1770,17 @@ class SessionDB:
 
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
+        if self._backend is not None:
+            prefix = f"sessions:msgs:{session_id}:"
+            for mk in self._backend.list_keys(prefix):
+                self._backend.delete_json(mk)
+            meta_key = self._meta_key(session_id)
+            with self._lock:
+                meta = self._backend.get_json(meta_key) or {}
+                meta["message_count"] = 0
+                meta["tool_call_count"] = 0
+                self._backend.set_json(meta_key, meta)
+            return
         def _do(conn):
             conn.execute(
                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
@@ -1384,6 +1798,22 @@ class SessionDB:
         than cascade-deleted, so they remain accessible independently.
         Returns True if the session was found and deleted.
         """
+        if self._backend is not None:
+            meta = self._backend.get_json(self._meta_key(session_id))
+            if not meta:
+                return False
+            # Orphan children
+            for k in self._backend.list_keys("sessions:meta:"):
+                child = self._backend.get_json(k)
+                if child and child.get("parent_session_id") == session_id:
+                    child["parent_session_id"] = None
+                    self._backend.set_json(k, child)
+            # Delete messages
+            for mk in self._backend.list_keys(f"sessions:msgs:{session_id}:"):
+                self._backend.delete_json(mk)
+            self._backend.delete_json(self._meta_key(session_id))
+            self._backend.delete_json(self._index_key(session_id))
+            return True
         def _do(conn):
             cursor = conn.execute(
                 "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
@@ -1409,6 +1839,18 @@ class SessionDB:
         than cascade-deleted.
         """
         cutoff = time.time() - (older_than_days * 86400)
+
+        if self._backend is not None:
+            to_delete = []
+            for k in self._backend.list_keys("sessions:meta:"):
+                meta = self._backend.get_json(k)
+                if (meta and meta.get("started_at", 0) < cutoff
+                        and meta.get("ended_at") is not None):
+                    if source is None or meta.get("source") == source:
+                        to_delete.append(meta["id"])
+            for sid in to_delete:
+                self.delete_session(sid)
+            return len(to_delete)
 
         def _do(conn):
             if source:
@@ -1441,3 +1883,66 @@ class SessionDB:
             return len(session_ids)
 
         return self._execute_write(_do)
+
+    # =========================================================================
+    # Convenience aliases for backward compatibility
+    # =========================================================================
+
+    def start_session(
+        self,
+        session_id: str,
+        source: str,
+        model: str = None,
+        model_config: Dict[str, Any] = None,
+        system_prompt: str = None,
+        user_id: str = None,
+        parent_session_id: str = None,
+    ) -> str:
+        """Alias for create_session."""
+        return self.create_session(
+            session_id=session_id,
+            source=source,
+            model=model,
+            model_config=model_config,
+            system_prompt=system_prompt,
+            user_id=user_id,
+            parent_session_id=parent_session_id,
+        )
+
+    def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str = None,
+        tool_name: str = None,
+        tool_calls: Any = None,
+        tool_call_id: str = None,
+        token_count: int = None,
+        finish_reason: str = None,
+        reasoning: str = None,
+        reasoning_details: Any = None,
+        codex_reasoning_items: Any = None,
+    ) -> int:
+        """Alias for append_message."""
+        return self.append_message(
+            session_id=session_id,
+            role=role,
+            content=content,
+            tool_name=tool_name,
+            tool_calls=tool_calls,
+            tool_call_id=tool_call_id,
+            token_count=token_count,
+            finish_reason=finish_reason,
+            reasoning=reasoning,
+            reasoning_details=reasoning_details,
+            codex_reasoning_items=codex_reasoning_items,
+        )
+
+    def list_sessions(
+        self,
+        source: str = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Alias for search_sessions."""
+        return self.search_sessions(source=source, limit=limit, offset=offset)

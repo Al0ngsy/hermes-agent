@@ -29,6 +29,24 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Storage backend integration — optional backend for SOUL.md persistence.
+# Call init_storage(backend) to activate; file fallback is always available.
+# ---------------------------------------------------------------------------
+
+_soul_backend = None  # Optional[StructuredStateBackend]
+
+
+def init_storage(backend) -> None:
+    """Configure a StructuredStateBackend for SOUL.md persistence.
+
+    When set, load_soul_md() reads from backend key ``"config:soul"`` first,
+    falling back to the filesystem if the backend has no entry.
+    """
+    global _soul_backend
+    _soul_backend = backend
+
+
+# ---------------------------------------------------------------------------
 # Context file scanning — detect prompt injection in AGENTS.md, .cursorrules,
 # SOUL.md before they get injected into the system prompt.
 # ---------------------------------------------------------------------------
@@ -904,12 +922,29 @@ def _truncate_content(content: str, filename: str, max_chars: int = CONTEXT_FILE
 
 
 def load_soul_md() -> Optional[str]:
-    """Load SOUL.md from HERMES_HOME and return its content, or None.
+    """Load SOUL.md from backend or HERMES_HOME filesystem.
 
     Used as the agent identity (slot #1 in the system prompt).  When this
     returns content, ``build_context_files_prompt`` should be called with
     ``skip_soul=True`` so SOUL.md isn't injected twice.
+
+    When a storage backend is configured via ``init_storage()``, reads from
+    backend key ``"config:soul"`` first; falls back to disk if not found.
     """
+    # Try backend first
+    if _soul_backend is not None:
+        try:
+            data = _soul_backend.get_json("config:soul", default={})
+            if data and data.get("content"):
+                content = data["content"].strip()
+                if content:
+                    content = _scan_context_content(content, "SOUL.md")
+                    content = _truncate_content(content, "SOUL.md")
+                    return content
+        except Exception as e:
+            logger.debug("Could not load SOUL.md from backend: %s", e)
+
+    # Fallback to filesystem
     try:
         from hermes_cli.config import ensure_hermes_home
         ensure_hermes_home()

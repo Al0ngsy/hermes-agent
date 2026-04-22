@@ -18,6 +18,7 @@ from .backends import (
     StorageBackendSet,
 )
 from .factory import create_storage_backends
+from .skill_registry import SkillRegistry
 
 __all__ = [
     "StructuredStateBackend",
@@ -26,4 +27,5 @@ __all__ = [
     "DistributedLockBackend",
     "StorageBackendSet",
     "create_storage_backends",
+    "SkillRegistry",
 ]

@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
@@ -3937,3 +3938,58 @@ def config_command(args):
         print("  hermes config path      Show config file path")
         print("  hermes config env-path  Show .env file path")
         sys.exit(1)
+
+
+# =============================================================================
+# Storage backend integration
+# =============================================================================
+
+_config_storage_backend = None  # Optional[StructuredStateBackend]
+
+
+def init_storage(backend) -> None:
+    """Configure a StructuredStateBackend for config and profile metadata persistence.
+
+    Once called, ConfigBackend and ProfileMetaBackend will use this backend.
+    File-based paths remain fully functional when this is not called.
+    """
+    global _config_storage_backend
+    _config_storage_backend = backend
+
+
+class ConfigBackend:
+    """Stores config.yaml content in the storage backend instead of disk."""
+
+    def __init__(self, backend):
+        self.backend = backend
+
+    def load_config(self) -> Dict:
+        data = self.backend.get_json("config:main", default={})
+        return data.get("config", {})
+
+    def save_config(self, config: Dict) -> None:
+        self.backend.set_json("config:main", {
+            "config": config,
+            "updated_at": time.time()
+        })
+
+
+class ProfileMetaBackend:
+    """Stores profile-level metadata (name, creation date, etc.) in the storage backend.
+
+    Key: ``"profile:meta"`` → dict of profile metadata fields.
+    """
+
+    def __init__(self, backend):
+        self.backend = backend
+
+    def get_meta(self) -> Dict:
+        """Return profile metadata dict, or {} if not set."""
+        return self.backend.get_json("profile:meta", default={}) or {}
+
+    def set_meta(self, meta: Dict) -> None:
+        """Persist profile metadata, stamping updated_at automatically."""
+        self.backend.set_json("profile:meta", {
+            **meta,
+            "updated_at": time.time(),
+        })

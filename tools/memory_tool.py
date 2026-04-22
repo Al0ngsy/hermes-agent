@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -53,6 +54,26 @@ logger = logging.getLogger(__name__)
 def get_memory_dir() -> Path:
     """Return the profile-scoped memories directory."""
     return get_hermes_home() / "memories"
+
+
+# ---------------------------------------------------------------------------
+# Storage backend integration — optional backend for memory persistence.
+# Call init_storage(backend) to activate; file fallback is always available.
+# ---------------------------------------------------------------------------
+
+_memory_backend = None  # Optional[StructuredStateBackend]
+
+
+def init_storage(backend) -> None:
+    """Configure a StructuredStateBackend for memory persistence.
+
+    When set, MemoryStore uses backend key ``"memory:index"`` to store
+    ``{"memory": [...], "user": [...], "updated_at": float}`` instead of
+    writing to MEMORY.md / USER.md files.  File-based paths remain
+    functional as a fallback when the backend is not configured.
+    """
+    global _memory_backend
+    _memory_backend = backend
 
 ENTRY_DELIMITER = "\n§\n"
 
@@ -122,7 +143,26 @@ class MemoryStore:
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
     def load_from_disk(self):
-        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
+        """Load entries from backend or MEMORY.md/USER.md files, capture system prompt snapshot.
+
+        When a storage backend is configured via ``init_storage()``, reads from
+        backend key ``"memory:index"`` first; falls back to disk if not found.
+        """
+        if _memory_backend is not None:
+            try:
+                data = _memory_backend.get_json("memory:index", default={})
+                if data:
+                    self.memory_entries = list(dict.fromkeys(data.get("memory", [])))
+                    self.user_entries = list(dict.fromkeys(data.get("user", [])))
+                    self._system_prompt_snapshot = {
+                        "memory": self._render_block("memory", self.memory_entries),
+                        "user": self._render_block("user", self.user_entries),
+                    }
+                    return
+            except Exception as e:
+                logger.debug("Could not load memory from backend, falling back to files: %s", e)
+
+        # Fallback: file-based
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
@@ -193,7 +233,23 @@ class MemoryStore:
         self._set_entries(target, fresh)
 
     def save_to_disk(self, target: str):
-        """Persist entries to the appropriate file. Called after every mutation."""
+        """Persist entries to backend or filesystem. Called after every mutation.
+
+        When a storage backend is configured via ``init_storage()``, updates
+        backend key ``"memory:index"`` in-place for the given target; falls
+        back to the filesystem when the backend is not configured or raises.
+        """
+        if _memory_backend is not None:
+            try:
+                data = _memory_backend.get_json("memory:index", default={}) or {}
+                data[target] = self._entries_for(target)
+                data["updated_at"] = time.time()
+                _memory_backend.set_json("memory:index", data)
+                return
+            except Exception as e:
+                logger.debug("Could not save memory to backend, falling back to file: %s", e)
+
+        # Fallback: file-based
         get_memory_dir().mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
 
