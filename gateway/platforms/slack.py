@@ -138,6 +138,8 @@ class SlackAdapter(BasePlatformAdapter):
         # Also load tokens from OAuth token file
         from hermes_constants import get_hermes_home
         tokens_file = get_hermes_home() / "slack_tokens.json"
+        # TODO(stateless): migrate tokens_file (~/.hermes/slack_tokens.json) to
+        #   EncryptedBlobBackend key "adapter:slack:tokens" (JSON map of team_id → token entry)
         if tokens_file.exists():
             try:
                 saved = json.loads(tokens_file.read_text(encoding="utf-8"))

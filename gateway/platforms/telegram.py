@@ -1696,6 +1696,8 @@ class TelegramAdapter(BasePlatformAdapter):
             from hermes_constants import get_hermes_home
             home = get_hermes_home()
             response_path = home / ".update_response"
+            # TODO(stateless): migrate response_path (~/.hermes/.update_response) to
+            #   EncryptedBlobBackend key "adapter:telegram:update_response" (plaintext answer)
             tmp = response_path.with_suffix(".tmp")
             tmp.write_text(answer)
             tmp.replace(response_path)

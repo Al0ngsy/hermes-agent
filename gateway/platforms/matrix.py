@@ -110,6 +110,8 @@ from hermes_constants import get_hermes_dir as _get_hermes_dir
 
 _STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
 _CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
+# TODO(stateless): migrate _CRYPTO_DB_PATH (E2EE Olm/Megolm keys + sync token)
+#   to EncryptedBlobBackend key "adapter:matrix:crypto_db" (binary SQLite blob)
 
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5

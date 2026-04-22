@@ -44,6 +44,11 @@ from hermes_constants import OPENROUTER_BASE_URL
 logger = logging.getLogger(__name__)
 
 try:
+    from storage.backends import EncryptedBlobBackend
+except ImportError:
+    EncryptedBlobBackend = None  # type: ignore[assignment,misc]
+
+try:
     import fcntl
 except Exception:
     fcntl = None
@@ -84,6 +89,48 @@ QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 # Google Gemini OAuth (google-gemini-cli provider, Cloud Code Assist backend)
 DEFAULT_GEMINI_CLOUDCODE_BASE_URL = "cloudcode-pa://google"
 GEMINI_OAUTH_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 60  # refresh 60s before expiry
+
+
+# =============================================================================
+# Storage-backend wiring for auth.json
+# =============================================================================
+
+class AuthBackend:
+    """Stores auth.json content in the encrypted blob backend."""
+
+    AUTH_KEY = "auth:store"
+
+    def __init__(self, blob_backend: "EncryptedBlobBackend") -> None:
+        self.backend = blob_backend
+
+    def load_auth_store(self) -> Dict:
+        """Load auth store. Returns empty dict if not found."""
+        data = self.backend.get_blob(self.AUTH_KEY)
+        if data is None:
+            return {}
+        return json.loads(data.decode("utf-8"))
+
+    def save_auth_store(self, store: Dict) -> None:
+        """Save auth store as encrypted blob."""
+        self.backend.set_blob(self.AUTH_KEY, json.dumps(store).encode("utf-8"))
+
+    def delete_auth_store(self) -> bool:
+        """Delete the auth store (e.g., on logout)."""
+        return self.backend.delete_blob(self.AUTH_KEY)
+
+
+_auth_backend: Optional[AuthBackend] = None
+
+
+def init_storage(blob_backend: "EncryptedBlobBackend") -> None:
+    """Wire the encrypted blob backend for auth store persistence.
+
+    Once called, ``_load_auth_store`` / ``_save_auth_store`` will delegate
+    to the backend instead of ``~/.hermes/auth.json``.  Call with *None* to
+    revert to file-based behavior (e.g., in tests).
+    """
+    global _auth_backend
+    _auth_backend = AuthBackend(blob_backend) if blob_backend is not None else None
 
 
 # =============================================================================
@@ -630,6 +677,16 @@ _auth_lock_holder = threading.local()
 @contextmanager
 def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
     """Cross-process advisory lock for auth.json reads+writes.  Reentrant."""
+    # When a storage backend is configured it handles its own atomicity —
+    # skip the file lock but keep the reentrant depth counter intact.
+    if _auth_backend is not None:
+        _auth_lock_holder.depth = getattr(_auth_lock_holder, "depth", 0) + 1
+        try:
+            yield
+        finally:
+            _auth_lock_holder.depth -= 1
+        return
+
     # Reentrant: if this thread already holds the lock, just yield.
     if getattr(_auth_lock_holder, "depth", 0) > 0:
         _auth_lock_holder.depth += 1
@@ -686,6 +743,19 @@ def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
 
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
+    # Use storage backend if configured and no explicit file path override is given.
+    if _auth_backend is not None and auth_file is None:
+        raw = _auth_backend.load_auth_store()
+        if not raw:
+            return {"version": AUTH_STORE_VERSION, "providers": {}}
+        if isinstance(raw, dict) and (
+            isinstance(raw.get("providers"), dict)
+            or isinstance(raw.get("credential_pool"), dict)
+        ):
+            raw.setdefault("providers", {})
+            return raw
+        return {"version": AUTH_STORE_VERSION, "providers": {}}
+
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
@@ -715,6 +785,14 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
 
 
 def _save_auth_store(auth_store: Dict[str, Any]) -> Path:
+    auth_store["version"] = AUTH_STORE_VERSION
+    auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    # Use storage backend if configured.
+    if _auth_backend is not None:
+        _auth_backend.save_auth_store(auth_store)
+        return _auth_file_path()
+
     auth_file = _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     auth_store["version"] = AUTH_STORE_VERSION

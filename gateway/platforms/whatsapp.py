@@ -174,6 +174,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
             "session_path",
             get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
         ))
+        # TODO(stateless): migrate self._session_path (WhatsApp baileys session state —
+        #   QR pairing, device keys, message store) to EncryptedBlobBackend key
+        #   "adapter:whatsapp:session" (serialised session directory as a zip/tar blob)
         self._reply_prefix: Optional[str] = config.extra.get("reply_prefix")
         self._dm_policy = str(config.extra.get("dm_policy") or os.getenv("WHATSAPP_DM_POLICY", "open")).strip().lower()
         self._allow_from = self._coerce_allow_list(config.extra.get("allow_from") or config.extra.get("allowFrom"))
