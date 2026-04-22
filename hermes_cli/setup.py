@@ -2971,11 +2971,81 @@ def setup_storage_backend(config: dict):
 
     print()
     print_success("PostgreSQL storage backend configured.")
-    print_info("To run in fully stateless mode, also set:")
-    print_info("  HERMES_STATELESS=1  (disables file-based logging, ephemeral HERMES_HOME)")
+
+    # ── Offer HERMES_STATELESS ────────────────────────────────────────────────
     print()
-    print_info("To migrate existing HERMES_HOME data into PostgreSQL:")
-    print_info("  python -m storage.migration  (or: hermes migrate-storage)")
+    current_stateless = get_env_value("HERMES_STATELESS") or ""
+    already_stateless = current_stateless.strip() in ("1", "true", "yes")
+    print_info("HERMES_STATELESS=1 disables file-based log handlers so no disk")
+    print_info("writes happen during normal operation. Recommended for containers.")
+    stateless_choice = prompt_choice(
+        "Enable stateless logging (HERMES_STATELESS=1)?",
+        ["Yes — write logs to stdout/stderr only (recommended for k8s/Docker)",
+         "No — keep file-based logging under HERMES_HOME"],
+        0 if not already_stateless else 1,
+    )
+    if stateless_choice == 0:
+        save_env_value("HERMES_STATELESS", "1")
+        print_success("HERMES_STATELESS=1 saved.")
+    else:
+        print_info("File-based logging kept.")
+
+    # ── What IS and IS NOT stateless ─────────────────────────────────────────
+    print()
+    print_info("─── What survives a pod restart WITHOUT a PVC ───")
+    print_info("  ✓  Sessions, memory, cron jobs, SOUL personality")
+    print_info("  ✓  Auth tokens (WhatsApp, Matrix, OAuth, etc.)")
+    print_info("  ✓  Skill metadata and registry")
+    print_info("  ✗  config.yaml and .env API keys  → pass as env vars / k8s Secrets")
+    print_info("  ✗  Skill files (SKILL.md, scripts) → still written to HERMES_HOME")
+    print_info("  ✗  Hub-installed / user-created skill content → same gap")
+    print()
+    print_info("For full k8s statelessness today, also provide:")
+    print_info("  • API keys (OPENROUTER_API_KEY etc.) as container env vars")
+    print_info("  • Model/agent config via env vars or a mounted ConfigMap")
+
+    # ── Offer migration of existing HERMES_HOME → PostgreSQL ─────────────────
+    print()
+    from hermes_cli.config import get_hermes_home as _get_hermes_home
+    _hermes_home = _get_hermes_home()
+    _has_local_data = any([
+        (_hermes_home / "sessions").exists(),
+        (_hermes_home / "memory.json").exists(),
+        (_hermes_home / "MEMORY.md").exists(),
+        (_hermes_home / "config.yaml").exists(),
+    ])
+
+    if _has_local_data:
+        print_info(f"Existing HERMES_HOME data found at: {_hermes_home}")
+        migrate_choice = prompt_choice(
+            "Migrate existing sessions, memory, cron, config, and skills to PostgreSQL?",
+            ["Yes — migrate now", "No — skip migration"],
+            0,
+        )
+        if migrate_choice == 0:
+            print_info("Running migration...")
+            try:
+                from storage.migration import HermesMigration, startup_init_backends
+                backends = startup_init_backends()
+                if backends is None:
+                    # Explicitly create for migration
+                    from storage.factory import create_storage_backends
+                    backends = create_storage_backends(
+                        backend_type="postgres", postgres_url=pg_url
+                    )
+                migration = HermesMigration(backends)
+                report = migration.import_all()
+                imported = report.get("imported", 0)
+                errors = report.get("errors", 0)
+                if errors:
+                    print_warning(f"Migrated {imported} items; {errors} error(s) — check logs.")
+                else:
+                    print_success(f"Migration complete: {imported} items imported.")
+                backends.close()
+            except Exception as exc_m:
+                print_warning(f"Migration failed: {exc_m}")
+                print_info("Run manually: python -m storage.migration")
+
 
 
 # =============================================================================

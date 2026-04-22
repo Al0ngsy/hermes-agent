@@ -110,9 +110,30 @@ All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes
 
 ## Stateless Deployment / PostgreSQL Storage
 
-By default Hermes stores all durable state — sessions, config, memory, skills, cron jobs, auth — under `HERMES_HOME` (`~/.hermes`) using SQLite and local files. This works great for single-user installs.
+By default Hermes stores all durable state under `HERMES_HOME` (`~/.hermes`) using SQLite and local files. This works great for single-user installs.
 
 For **containerized deployments** with no persistent volumes, multiple replicas, or managed databases you can switch to PostgreSQL as the single system of record.
+
+### What survives a pod restart with PostgreSQL (no PVC needed)
+
+| Data | In PostgreSQL? | Notes |
+|------|---------------|-------|
+| Sessions & conversation history | ✅ Yes | |
+| Memory & user profile | ✅ Yes | |
+| Cron jobs & schedule | ✅ Yes | |
+| SOUL personality file | ✅ Yes | |
+| Auth tokens (WhatsApp, Matrix, OAuth…) | ✅ Yes | Encrypted blobs |
+| Skill metadata & registry | ✅ Yes | |
+| `config.yaml` settings | ❌ No | Pass as env vars or k8s ConfigMap |
+| API keys (`.env`) | ❌ No | Pass as k8s Secrets / env vars |
+| Skill file content (SKILL.md, scripts) | ❌ No | Still written to `HERMES_HOME/skills/` |
+| Hub-installed / user-created skill files | ❌ No | Same gap as above |
+
+**For a fully PVC-free k8s deployment today:**
+- Set `OPENROUTER_API_KEY` (and any other API keys) as container env vars or k8s Secrets
+- Provide model/agent config via env vars or a mounted ConfigMap
+- Built-in skills are bundled in the image and always available
+- User-created skills learned during conversations will not survive pod restart without a small PVC for `HERMES_HOME/skills/`
 
 ### Environment Variables
 
@@ -150,7 +171,7 @@ services:
       HERMES_STORAGE_BACKEND: postgres
       HERMES_STORAGE_POSTGRES_URL: postgresql://hermes:secret@postgres:5432/hermes
       HERMES_STATELESS: "1"
-      OPENROUTER_API_KEY: sk-or-...
+      OPENROUTER_API_KEY: sk-or-...    # pass secrets as env vars, not via hermes setup
     depends_on:
       - postgres
 
@@ -160,11 +181,14 @@ volumes:
 
 ### Configuring via `hermes setup`
 
-Run `hermes setup storage` (or choose "External Storage Backend" from the full setup wizard) to interactively enter your PostgreSQL URL and test the connection.
+Run `hermes setup storage` (or choose "External Storage Backend" from the full setup wizard) to interactively:
+- Enter your PostgreSQL URL and test the connection
+- Enable `HERMES_STATELESS=1` (stdout-only logging)
+- Migrate existing `HERMES_HOME` data into PostgreSQL
 
 ### Migrating Existing Data
 
-To import your existing `HERMES_HOME` data into PostgreSQL:
+The setup wizard offers migration automatically after a successful connection. To run it manually:
 
 ```bash
 HERMES_STORAGE_BACKEND=postgres HERMES_STORAGE_POSTGRES_URL=postgresql://... \
