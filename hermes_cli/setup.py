@@ -3025,28 +3025,49 @@ def setup_storage_backend(config: dict):
         if migrate_choice == 0:
             print_info("Running migration...")
             try:
+                from pathlib import Path as _Path
                 from storage.migration import HermesMigration, startup_init_backends
+                from hermes_cli.config import get_hermes_home as _get_hermes_home2
                 backends = startup_init_backends()
                 if backends is None:
-                    # Explicitly create for migration
                     from storage.factory import create_storage_backends
                     backends = create_storage_backends(
                         backend_type="postgres", postgres_url=pg_url
                     )
-                migration = HermesMigration(backends)
-                report = migration.import_all()
-                imported = report.get("imported", 0)
-                errors = report.get("errors", 0)
-                if errors:
-                    print_warning(f"Migrated {imported} items; {errors} error(s) — check logs.")
+                migration = HermesMigration(_Path(_get_hermes_home2()), backends)
+                results = migration.import_all()
+                total_imported = sum(r.items_imported for r in results.values())
+                total_errors = sum(len(r.errors) for r in results.values())
+                if total_errors:
+                    print_warning(f"Migrated {total_imported} items; {total_errors} error(s) — check logs.")
                 else:
-                    print_success(f"Migration complete: {imported} items imported.")
+                    print_success(f"Migration complete: {total_imported} items imported across {len(results)} sections.")
                 backends.close()
             except Exception as exc_m:
                 print_warning(f"Migration failed: {exc_m}")
                 print_info("Run manually: python -m storage.migration")
 
-
+    # ── Skill reconciliation cron job ─────────────────────────────────────────
+    print()
+    print_info("Skill files (SKILL.md, scripts) are still written to the local")
+    print_info("filesystem but are synced to PostgreSQL for pod-restart recovery.")
+    print_info("On startup Hermes restores skill files from the DB automatically.")
+    cron_choice = prompt_choice(
+        "Register a periodic skill-sync cron job (every 15 min)?",
+        ["Yes — reconcile skill files to PostgreSQL every 15 minutes",
+         "No — rely on real-time sync only (skill saved on every write)"],
+        0,
+    )
+    if cron_choice == 0:
+        try:
+            from storage.skill_sync import register_reconciliation_cron_job
+            job_id = register_reconciliation_cron_job(interval_minutes=15)
+            if job_id:
+                print_success(f"Cron job registered (id: {job_id}) — every 15 minutes.")
+            else:
+                print_warning("Could not register cron job — check logs.")
+        except Exception as exc_c:
+            print_warning(f"Cron job registration failed: {exc_c}")
 
 # =============================================================================
 # Main Wizard Orchestrator

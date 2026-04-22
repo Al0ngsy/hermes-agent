@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 # backend via SkillRegistry.  File-based logic continues to work when not set.
 # ---------------------------------------------------------------------------
 _skills_backend = None  # type: Optional[Any]  # StructuredStateBackend
+_artifact_backend = None  # type: Optional[Any]  # ArtifactStorageBackend
 
 
 def init_storage(backend) -> None:
@@ -63,6 +64,22 @@ def init_storage(backend) -> None:
     logger.debug(
         "skill_manager_tool: storage backend configured (%s)", type(backend).__name__
     )
+
+
+def init_artifact_storage(backend) -> None:
+    """Opt-in to artifact backend for skill file persistence (stateless mode)."""
+    global _artifact_backend
+    _artifact_backend = backend
+    logger.debug(
+        "skill_manager_tool: artifact backend configured (%s)", type(backend).__name__
+    )
+
+
+def _get_artifact_backend():
+    """Return the artifact backend, or raise RuntimeError if not configured."""
+    if _artifact_backend is None:
+        raise RuntimeError("artifact backend not configured")
+    return _artifact_backend
 
 
 def get_skill_registry():
@@ -302,6 +319,9 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
     the target file is never left in a partially-written state if the process
     crashes or is interrupted.
     
+    After a successful write, the file is synced to the artifact storage backend
+    (best-effort) so skill content persists in PostgreSQL for stateless containers.
+    
     Args:
         file_path: Target file path
         content: Content to write
@@ -324,6 +344,20 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
         except OSError:
             logger.error("Failed to remove temporary file %s during atomic write", temp_path, exc_info=True)
         raise
+
+    # Best-effort: persist the skill file to the artifact backend so it
+    # survives pod restarts in stateless (postgres) deployments.
+    try:
+        from storage.migration import _backends_initialized
+        if _backends_initialized:
+            from storage.skill_sync import save_skill_file
+            save_skill_file(
+                _get_artifact_backend(),
+                SKILLS_DIR,
+                file_path,
+            )
+    except Exception:
+        pass  # never let sync errors surface to the caller
 
 
 # =============================================================================

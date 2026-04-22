@@ -715,9 +715,25 @@ def _wire_backends(backends: StorageBackendSet) -> None:
     try:
         from tools import skill_manager_tool
         skill_manager_tool.init_storage(backends.structured)
+        skill_manager_tool.init_artifact_storage(backends.artifacts)
         logger.debug("Wired: tools.skill_manager_tool")
     except ImportError:
         pass
+
+    # Restore skill files from backend → HERMES_HOME/skills/ so file-scanning
+    # skill readers work on a fresh container without a PVC.
+    try:
+        from storage.skill_sync import restore_skills_from_backend as _restore_skills
+        from agent.skill_utils import get_skills_dir as _get_skills_dir
+        _skills_dir = _get_skills_dir()
+        _result = _restore_skills(backends.artifacts, _skills_dir)
+        if _result["files"] > 0:
+            logger.info(
+                "skill_sync: restored %d skills (%d files) from backend",
+                _result["skills"], _result["files"],
+            )
+    except Exception as _exc:
+        logger.debug("skill_sync: restore skipped: %s", _exc)
 
     # hermes_logging — configure stateless if requested
     try:
