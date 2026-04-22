@@ -366,11 +366,13 @@ class LocalDistributedLockBackend(DistributedLockBackend):
         self, lock_id: str, duration_seconds: float, wait_seconds: float = 0
     ) -> Optional[LockHandle]:
         expires_at = time.time() + duration_seconds
-        deadline = time.time() + wait_seconds if wait_seconds > 0 else time.time()
+        # Deadline is the wall-clock time after which we stop retrying.
+        # Always attempt at least once (loop body runs before deadline check).
+        deadline = time.time() + wait_seconds
 
-        while time.time() <= deadline:
+        while True:
             with self._lock:
-                # Evict any expired row first so it doesn't block us.
+                # Evict any expired row so it doesn't block us.
                 self._conn.execute(
                     "DELETE FROM locks WHERE lock_id = ? AND expires_at <= ?",
                     (lock_id, time.time()),
@@ -383,12 +385,12 @@ class LocalDistributedLockBackend(DistributedLockBackend):
                     self._conn.commit()
                     return LockHandle(lock_id, expires_at, self)
                 except sqlite3.IntegrityError:
-                    # A live (non-expired) lock is already held.
-                    if wait_seconds <= 0:
-                        return None
-            time.sleep(0.05)
+                    pass  # A live lock is held; fall through to retry logic.
 
-        return None
+            # Retry only while time budget remains.
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.05)
 
     def release_lock(self, lock_id: str) -> bool:
         with self._lock:
