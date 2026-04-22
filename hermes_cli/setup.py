@@ -2901,14 +2901,57 @@ def setup_storage_backend(config: dict):
     save_env_value("HERMES_STORAGE_BACKEND", "postgres")
     save_env_value("HERMES_STORAGE_POSTGRES_URL", pg_url)
 
-    # Test the connection
+    # Test the connection — auto-install psycopg if missing
     print()
     print_info("Testing PostgreSQL connection...")
-    try:
+
+    def _try_connect():
         from storage.factory import create_storage_backends
         backends = create_storage_backends(backend_type="postgres", postgres_url=pg_url)
         backends.close()
+
+    try:
+        _try_connect()
         print_success("PostgreSQL connection successful! Schema initialized.")
+    except RuntimeError as exc:
+        if "psycopg" in str(exc).lower():
+            print_warning("psycopg driver not installed.")
+            install_choice = prompt_choice(
+                "Install psycopg now?",
+                ["Yes — install psycopg[binary] + psycopg-pool", "No — I'll install manually"],
+                0,
+            )
+            if install_choice == 0:
+                import subprocess, sys
+                print_info("Installing psycopg[binary] psycopg-pool ...")
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "psycopg[binary]", "psycopg-pool"],
+                    capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    print_success("Installed successfully. Retrying connection...")
+                    try:
+                        _try_connect()
+                        print_success("PostgreSQL connection successful! Schema initialized.")
+                    except Exception as exc2:
+                        print_warning(f"Connection failed after install: {exc2}")
+                        print_warning("Settings saved — check URL and retry with 'hermes setup storage'.")
+                        return
+                else:
+                    print_warning("Installation failed:")
+                    print_info(result.stderr.strip())
+                    print_info("Run manually:  pip install 'psycopg[binary]' psycopg-pool")
+                    print_warning("Settings saved — retry 'hermes setup storage' after installing.")
+                    return
+            else:
+                print_info("Run:  pip install 'psycopg[binary]' psycopg-pool")
+                print_warning("Settings saved — retry 'hermes setup storage' after installing.")
+                return
+        else:
+            print_warning(f"Connection test failed: {exc}")
+            print_warning("Settings saved — Hermes will retry at startup.")
+            print_info("Check that the database server is reachable and credentials are correct.")
+            return
     except Exception as exc:
         print_warning(f"Connection test failed: {exc}")
         print_warning("Settings saved — Hermes will retry at startup.")
