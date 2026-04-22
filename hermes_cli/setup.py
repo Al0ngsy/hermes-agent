@@ -2922,17 +2922,22 @@ def setup_storage_backend(config: dict):
                 0,
             )
             if install_choice == 0:
-                import subprocess, sys
+                import shutil, subprocess, sys
                 from pathlib import Path as _Path
 
-                # Prefer the pip binary next to sys.executable; fall back to -m pip.
-                _pip_bin = _Path(sys.executable).parent / "pip"
-                if _pip_bin.exists():
+                # Build an install command. Priority: uv pip > pip binary > python -m pip.
+                _py_dir = _Path(sys.executable).parent
+                _uv = shutil.which("uv")
+                _pip_bin = _py_dir / "pip"
+                if _uv:
+                    pip_cmd = [_uv, "pip", "install", "--python", sys.executable,
+                               "psycopg[binary]", "psycopg-pool"]
+                elif _pip_bin.exists():
                     pip_cmd = [str(_pip_bin), "install", "psycopg[binary]", "psycopg-pool"]
                 else:
                     pip_cmd = [sys.executable, "-m", "pip", "install", "psycopg[binary]", "psycopg-pool"]
 
-                print_info(f"Installing psycopg[binary] psycopg-pool ...")
+                print_info("Installing psycopg[binary] psycopg-pool ...")
                 result = subprocess.run(pip_cmd, capture_output=True, text=True)
                 if result.returncode == 0:
                     print_success("Installed successfully. Retrying connection...")
@@ -2946,11 +2951,11 @@ def setup_storage_backend(config: dict):
                 else:
                     print_warning("Installation failed:")
                     print_info((result.stderr or result.stdout).strip())
-                    print_info("Run manually:  pip install 'psycopg[binary]' psycopg-pool")
+                    print_info("Run manually:  uv pip install 'psycopg[binary]' psycopg-pool")
                     print_warning("Settings saved — retry 'hermes setup storage' after installing.")
                     return
             else:
-                print_info("Run:  pip install 'psycopg[binary]' psycopg-pool")
+                print_info("Run:  uv pip install 'psycopg[binary]' psycopg-pool")
                 print_warning("Settings saved — retry 'hermes setup storage' after installing.")
                 return
         else:
