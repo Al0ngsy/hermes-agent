@@ -2555,6 +2555,14 @@ def _get_section_config_summary(config: dict, section_key: str) -> Optional[str]
             return ", ".join(tools)
         return None
 
+    elif section_key == "storage":
+        backend = get_env_value("HERMES_STORAGE_BACKEND") or "local"
+        if backend == "postgres":
+            url = get_env_value("HERMES_STORAGE_POSTGRES_URL") or ""
+            host = url.split("@")[-1].split("/")[0] if "@" in url else url
+            return f"postgres @ {host}" if host else "postgres"
+        return None  # local is the default, prompt user to configure if they want
+
     return None
 
 
@@ -3071,6 +3079,7 @@ def run_setup_wizard(args):
             "Messaging Platforms (Gateway)",
             "Tools",
             "Agent Settings",
+            "External Storage Backend",
             "Exit",
         ]
         choice = prompt_choice("What would you like to do?", menu_choices, 0)
@@ -3082,10 +3091,10 @@ def run_setup_wizard(args):
         elif choice == 1:
             # Full setup — fall through to run all sections
             pass
-        elif choice == 7:
+        elif choice == 8:
             print_info("Exiting. Run 'hermes setup' again when ready.")
             return
-        elif 2 <= choice <= 6:
+        elif 2 <= choice <= 7:
             # Individual section — map by key, not by position.
             # SETUP_SECTIONS includes TTS but the returning-user menu skips it,
             # so positional indexing (choice - 2) would dispatch the wrong section.
@@ -3149,6 +3158,10 @@ def run_setup_wizard(args):
     # Section 5: Tools
     if not (migration_ran and _skip_configured_section(config, "tools", "Tools")):
         setup_tools(config, first_install=not is_existing)
+
+    # Section 6: External Storage Backend (optional — skipped if already configured)
+    if not (migration_ran and _skip_configured_section(config, "storage", "External Storage Backend")):
+        setup_storage_backend(config)
 
     # Save and show summary
     save_config(config)
