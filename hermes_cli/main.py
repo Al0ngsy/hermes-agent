@@ -188,6 +188,21 @@ try:
 except Exception:
     pass  # best-effort — don't crash if config isn't available yet
 
+# Wire up storage backends (HERMES_STORAGE_BACKEND env var).
+# In local mode this is a no-op. In postgres mode this opens the connection
+# pool and initializes all subsystem modules.
+try:
+    from storage.migration import startup_init_backends as _startup_init_backends
+
+    _startup_init_backends()
+except Exception as _storage_exc:
+    import logging as _logging
+
+    _logging.getLogger(__name__).warning(
+        "Storage backend init failed — falling back to local: %s", _storage_exc
+    )
+    del _storage_exc
+
 import logging
 import time as _time
 from datetime import datetime

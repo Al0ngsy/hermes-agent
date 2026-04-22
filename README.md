@@ -108,6 +108,73 @@ All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes
 
 ---
 
+## Stateless Deployment / PostgreSQL Storage
+
+By default Hermes stores all durable state — sessions, config, memory, skills, cron jobs, auth — under `HERMES_HOME` (`~/.hermes`) using SQLite and local files. This works great for single-user installs.
+
+For **containerized deployments** with no persistent volumes, multiple replicas, or managed databases you can switch to PostgreSQL as the single system of record.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HERMES_STORAGE_BACKEND` | `local` | Set to `postgres` to enable PostgreSQL storage. `local` uses SQLite + filesystem under `HERMES_HOME`. |
+| `HERMES_STORAGE_POSTGRES_URL` | _(none)_ | Required when `HERMES_STORAGE_BACKEND=postgres`. Full connection URL: `postgresql://user:pass@host:5432/dbname` |
+| `HERMES_STATELESS` | _(unset)_ | Set to `1` to disable file-based log handlers; logs go to stdout/stderr only. Recommended alongside `postgres` backend. |
+
+### Database Setup
+
+Hermes **automatically creates all required tables** the first time it connects. You only need to:
+
+1. Create the database (e.g. `CREATE DATABASE hermes;`)
+2. Grant the user `CREATE TABLE` privileges
+
+No manual `psql` schema scripts needed. All tables are created via `CREATE TABLE IF NOT EXISTS` so restarts are safe.
+
+### Quick Start (Docker Compose)
+
+```yaml
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: hermes
+      POSTGRES_USER: hermes
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  hermes:
+    image: hermes-agent:latest
+    environment:
+      HERMES_STORAGE_BACKEND: postgres
+      HERMES_STORAGE_POSTGRES_URL: postgresql://hermes:secret@postgres:5432/hermes
+      HERMES_STATELESS: "1"
+      OPENROUTER_API_KEY: sk-or-...
+    depends_on:
+      - postgres
+
+volumes:
+  pgdata:
+```
+
+### Configuring via `hermes setup`
+
+Run `hermes setup storage` (or choose "External Storage Backend" from the full setup wizard) to interactively enter your PostgreSQL URL and test the connection.
+
+### Migrating Existing Data
+
+To import your existing `HERMES_HOME` data into PostgreSQL:
+
+```bash
+HERMES_STORAGE_BACKEND=postgres HERMES_STORAGE_POSTGRES_URL=postgresql://... \
+  python -m storage.migration
+```
+
+See [`storage/README.md`](storage/README.md) for full architecture details, backend API reference, and advanced configuration.
+
+---
+
 ## Migrating from OpenClaw
 
 If you're coming from OpenClaw, Hermes can automatically import your settings, memories, skills, and API keys.

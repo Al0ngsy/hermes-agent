@@ -118,8 +118,13 @@ backends = create_storage_backends(
 
 ### Environment Variables
 
-- **HERMES_STORAGE_BACKEND:** "local" (default) or "postgres"
-- **HERMES_STORAGE_POSTGRES_URL:** PostgreSQL connection string for postgres backend
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HERMES_STORAGE_BACKEND` | `local` | `local` uses SQLite + filesystem under `HERMES_HOME`. Set to `postgres` to move all durable state to PostgreSQL. |
+| `HERMES_STORAGE_POSTGRES_URL` | _(none)_ | Required when `HERMES_STORAGE_BACKEND=postgres`. Full DSN, e.g. `postgresql://user:pass@host:5432/hermes` |
+| `HERMES_STATELESS` | _(unset)_ | Set to `1` to disable file-based log handlers (logs go to stdout/stderr only). Recommended alongside `postgres` backend. |
+
+**Database auto-initialization:** When using `HERMES_STORAGE_BACKEND=postgres`, Hermes automatically creates all required tables on the first connection via `CREATE TABLE IF NOT EXISTS` statements. You only need to create the database and grant `CREATE TABLE` privileges. No manual schema scripts required.
 
 ### Structured State Example
 
@@ -205,59 +210,56 @@ To run Hermes without persistent volumes:
 
 ## Implementation Status
 
-### Completed (Step 1-2)
-✅ Storage abstraction layer with four backend contracts
-✅ Local backend (SQLite + filesystem)
-✅ Factory function with environment variable support
-✅ Test suite (local backend tested)
-
-### Planned (Steps 3-10)
-⬜ PostgreSQL backend implementation (structured, blobs, artifacts, locks)
-⬜ Migrate SessionDB to use storage layer
-⬜ Migrate cron/jobs.py to use storage layer
-⬜ Migrate config/SOUL/memory to use storage layer
-⬜ Migrate auth/adapter state to use storage layer
-⬜ Migrate skills metadata to use storage layer
-⬜ Rework logging and artifacts
-⬜ Migration tooling (import existing HERMES_HOME)
-⬜ Integration tests (multi-instance, restart, recovery)
-⬜ Regression tests (zero-PVC assertions)
+### Completed (Steps 1–10)
+✅ Storage abstraction layer — four backend contracts (`StructuredStateBackend`, `EncryptedBlobBackend`, `ArtifactStorageBackend`, `DistributedLockBackend`)
+✅ Local backend — SQLite FTS5 + filesystem (default, zero-config)
+✅ PostgreSQL backend — psycopg3, JSONB, pg_trgm, BYTEA, lock table with TTL; schema auto-created on first connect
+✅ Factory function with environment variable selection
+✅ Session migration — `hermes_state.py` (`SessionDB`) reads/writes via storage backend
+✅ Cron migration — `cron/jobs.py` uses distributed locks + artifact storage for outputs
+✅ Config / SOUL / memory migration — `hermes_cli/config.py`, `agent/prompt_builder.py`, `tools/memory_tool.py`
+✅ Auth / adapter migration — `hermes_cli/auth.py` uses encrypted blobs backend
+✅ Skills migration — `tools/skills_tool.py` and `tools/skill_manager_tool.py` use `SkillRegistry`
+✅ Logging rework — `hermes_logging.py`: `configure_stateless_logging()`, `ArtifactLogger`, `HERMES_STATELESS` env var
+✅ Migration tooling — `startup_init_backends()`, `HermesMigration.import_all()`, `validate_parity()`
+✅ Integration tests — 32 tests (restart continuity across all subsystems)
+✅ Multi-replica tests — 13 tests (distributed lock exclusivity, concurrent session writes)
+✅ Durable-write regression tests — 15 tests (no unexpected disk writes in postgres mode)
 
 ## Testing
 
-### Run Local Backend Tests
+### Run the Full Test Suite
+```bash
+pytest tests/test_stateless_integration.py   # 32 tests — restart continuity
+pytest tests/test_multi_replica.py           # 13 tests — distributed locks + concurrency
+pytest tests/test_stateless_durable_writes.py # 15 tests — no unexpected disk writes
+```
+
+### Quick Smoke Test (Local Backend)
 ```bash
 python3 -c "
 from storage.factory import create_storage_backends
 
 backends = create_storage_backends(backend_type='local')
-
-# Test structured state
 backends.structured.set_json('test:key', {'value': 42})
 assert backends.structured.get_json('test:key') == {'value': 42}
-
-# Test encrypted blob
 backends.encrypted_blobs.set_blob('secret', b'data')
 assert backends.encrypted_blobs.get_blob('secret') == b'data'
-
-# Test artifacts
 backends.artifacts.write_artifact('artifact1', b'content')
 assert backends.artifacts.read_artifact('artifact1') == b'content'
-
-# Test locks
 lock = backends.locks.acquire_lock('lock1', duration_seconds=10)
 assert lock is not None
-
 backends.close()
 print('All tests passed!')
 "
 ```
 
-### Future: Run Full Test Suite with PostgreSQL
+### Run Tests with PostgreSQL
 ```bash
-export HERMES_TEST_POSTGRES_URL=postgresql://...
-pytest tests/test_storage_backends.py -v
+export HERMES_TEST_POSTGRES_URL=postgresql://user:pass@localhost:5432/hermes_test
+pytest tests/test_stateless_integration.py tests/test_multi_replica.py -v
 ```
+
 
 ## Design Decisions
 
@@ -265,12 +267,8 @@ pytest tests/test_storage_backends.py -v
 
 2. **Key-value abstraction:** Simple and flexible, avoiding SQL complexity in higher layers. Backends can use arbitrary storage (files, SQL, object storage).
 
-3. **No Redis:** PostgreSQL advisory locks are sufficient for multi-instance coordination. Redis adds operational complexity.
+3. **No Redis:** PostgreSQL TTL-based lock table is sufficient for multi-instance coordination. Redis adds operational complexity.
 
 4. **Object storage optional:** Large artifacts can defer to S3/GCS later, but core state stays in PostgreSQL.
 
-5. **Backward compatible:** Local backend wraps existing behavior, no forced migration.
-
-## Next Steps
-
-See `.plans/hermes-stateless-external-state.md` for full roadmap.
+5. **Backward compatible:** Local backend wraps existing behavior with no forced migration. All modules fall back to filesystem/SQLite when no backend is configured.

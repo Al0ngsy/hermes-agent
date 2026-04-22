@@ -2829,6 +2829,94 @@ def _offer_openclaw_migration(hermes_home: Path) -> bool:
 
 
 # =============================================================================
+# Section: External Storage Backend (PostgreSQL / stateless mode)
+# =============================================================================
+
+
+def setup_storage_backend(config: dict):
+    """Configure external storage backend for stateless / multi-replica operation.
+
+    By default Hermes stores all state under HERMES_HOME (local SQLite + files).
+    Set HERMES_STORAGE_BACKEND=postgres to move all durable state to a PostgreSQL
+    database, enabling stateless container deployments with no persistent volumes.
+    """
+    print_header("External Storage Backend")
+    print_info("Hermes can store all durable state in PostgreSQL instead of local disk.")
+    print_info("This enables stateless containers, multi-replica deployments,")
+    print_info("and disaster recovery without persistent volumes.")
+    print()
+
+    current_backend = get_env_value("HERMES_STORAGE_BACKEND") or "local"
+    current_url = get_env_value("HERMES_STORAGE_POSTGRES_URL") or ""
+
+    choices = [
+        f"Local (SQLite + filesystem under HERMES_HOME) — current: {current_backend == 'local' and 'active' or 'inactive'}",
+        "PostgreSQL (stateless mode — all state in Postgres)",
+        "Skip — keep current setting",
+    ]
+
+    idx = prompt_choice("Storage backend:", choices, 2 if current_backend == "local" else 2)
+
+    if idx == 2:
+        print_info("Keeping current storage backend.")
+        return
+
+    if idx == 0:
+        # Switch back to local
+        save_env_value("HERMES_STORAGE_BACKEND", "local")
+        print_success("Storage backend set to: local (default)")
+        return
+
+    # PostgreSQL path
+    print()
+    print_info("Enter your PostgreSQL connection URL.")
+    print_info("Format: postgresql://user:password@host:5432/dbname")
+    print_info("Hermes will automatically create all required tables on first start.")
+    print()
+
+    existing_url = current_url
+    pg_url = prompt(
+        "PostgreSQL URL",
+        default=existing_url if existing_url else None,
+        password=False,
+    ).strip()
+
+    if not pg_url:
+        print_warning("No URL entered — keeping current storage backend.")
+        return
+
+    if not pg_url.startswith(("postgresql://", "postgres://")):
+        print_warning("URL must start with postgresql:// or postgres://")
+        print_warning("Storage backend not changed.")
+        return
+
+    save_env_value("HERMES_STORAGE_BACKEND", "postgres")
+    save_env_value("HERMES_STORAGE_POSTGRES_URL", pg_url)
+
+    # Test the connection
+    print()
+    print_info("Testing PostgreSQL connection...")
+    try:
+        from storage.factory import create_storage_backends
+        backends = create_storage_backends(backend_type="postgres", postgres_url=pg_url)
+        backends.close()
+        print_success("PostgreSQL connection successful! Schema initialized.")
+    except Exception as exc:
+        print_warning(f"Connection test failed: {exc}")
+        print_warning("Settings saved — Hermes will retry at startup.")
+        print_info("Check that the database server is reachable and credentials are correct.")
+        return
+
+    print()
+    print_success("PostgreSQL storage backend configured.")
+    print_info("To run in fully stateless mode, also set:")
+    print_info("  HERMES_STATELESS=1  (disables file-based logging, ephemeral HERMES_HOME)")
+    print()
+    print_info("To migrate existing HERMES_HOME data into PostgreSQL:")
+    print_info("  python -m storage.migration  (or: hermes migrate-storage)")
+
+
+# =============================================================================
 # Main Wizard Orchestrator
 # =============================================================================
 
@@ -2839,6 +2927,7 @@ SETUP_SECTIONS = [
     ("gateway", "Messaging Platforms (Gateway)", setup_gateway),
     ("tools", "Tools", setup_tools),
     ("agent", "Agent Settings", setup_agent_settings),
+    ("storage", "External Storage Backend", setup_storage_backend),
 ]
 
 # The returning-user menu intentionally omits standalone TTS because model setup
@@ -2850,6 +2939,7 @@ RETURNING_USER_MENU_SECTION_KEYS = [
     "gateway",
     "tools",
     "agent",
+    "storage",
 ]
 
 
