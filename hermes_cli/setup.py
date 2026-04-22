@@ -3047,27 +3047,9 @@ def setup_storage_backend(config: dict):
                 print_warning(f"Migration failed: {exc_m}")
                 print_info("Run manually: python -m storage.migration")
 
-    # ── Skill reconciliation cron job ─────────────────────────────────────────
     print()
-    print_info("Skill files (SKILL.md, scripts) are still written to the local")
-    print_info("filesystem but are synced to PostgreSQL for pod-restart recovery.")
-    print_info("On startup Hermes restores skill files from the DB automatically.")
-    cron_choice = prompt_choice(
-        "Register a periodic skill-sync cron job (every 15 min)?",
-        ["Yes — reconcile skill files to PostgreSQL every 15 minutes",
-         "No — rely on real-time sync only (skill saved on every write)"],
-        0,
-    )
-    if cron_choice == 0:
-        try:
-            from storage.skill_sync import register_reconciliation_cron_job
-            job_id = register_reconciliation_cron_job(interval_minutes=15)
-            if job_id:
-                print_success(f"Cron job registered (id: {job_id}) — every 15 minutes.")
-            else:
-                print_warning("Could not register cron job — check logs.")
-        except Exception as exc_c:
-            print_warning(f"Cron job registration failed: {exc_c}")
+    print_info("Skill files are synced to PostgreSQL on every write and restored")
+    print_info("from the DB automatically on pod/container restart.")
 
 # =============================================================================
 # Main Wizard Orchestrator

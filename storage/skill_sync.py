@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -218,57 +217,3 @@ def restore_skills_from_backend(
         "skipped": files_skipped,
         "errors": errors,
     }
-
-
-def register_reconciliation_cron_job(interval_minutes: int = 15) -> Optional[str]:
-    """Register a Hermes cron job that reconciles skill files to the backend.
-
-    Uses the `script` field to run the sync as a Python one-liner, so no agent
-    prompt or LLM call is needed for the reconciliation itself.
-
-    Idempotent — if a job with id ``skill-sync-reconcile`` already exists it
-    is updated with the new interval but not duplicated.
-
-    Returns the job_id on success, None on failure.
-    """
-    _SYNC_JOB_ID = "skill-sync-reconcile"
-    _SYNC_SCRIPT = (
-        "from storage.skill_sync import save_all_skills; "
-        "from agent.skill_utils import get_all_skills_dirs; "
-        "from storage.migration import startup_init_backends; "
-        "b = startup_init_backends(); "
-        "r = save_all_skills(b.artifacts, get_all_skills_dirs()) if b else {'skills':0,'files':0,'errors':0}; "
-        "print(f\"Synced {r['skills']} skills ({r['files']} files, {r['errors']} errors) to PostgreSQL\")"
-    )
-
-    try:
-        from cron import jobs as cron_jobs
-
-        existing = cron_jobs.load_jobs()
-        if _SYNC_JOB_ID in existing:
-            logger.debug("skill_sync: reconciliation cron job already registered")
-            return _SYNC_JOB_ID
-
-        job = cron_jobs.create_job(
-            prompt="Skill sync reconciliation complete. Output: {output}",
-            schedule=f"every {interval_minutes} minutes",
-            name="Skill Sync — PostgreSQL reconciliation",
-            deliver="local",
-            script=f"python3 -c '{_SYNC_SCRIPT}'",
-        )
-        # Override the auto-generated id with our stable sentinel
-        from cron.jobs import save_jobs
-        jobs_dict = cron_jobs.load_jobs()
-        job_with_stable_id = {**job, "id": _SYNC_JOB_ID}
-        # Remove the original auto-id entry and insert with stable id
-        jobs_dict.pop(job["id"], None)
-        jobs_dict[_SYNC_JOB_ID] = job_with_stable_id
-        save_jobs(jobs_dict)
-
-        logger.info(
-            "skill_sync: registered reconciliation cron job every %d minutes", interval_minutes
-        )
-        return _SYNC_JOB_ID
-    except Exception as exc:
-        logger.warning("skill_sync: failed to register cron job: %s", exc)
-        return None
