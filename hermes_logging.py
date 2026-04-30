@@ -266,6 +266,9 @@ def setup_logging(
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
         )
 
+    if _logging_initialized and not force:
+        return log_dir
+
     # Ensure root logger level is low enough for the handlers to fire.
     if root.level == logging.NOTSET or root.level > level:
         root.setLevel(level)
